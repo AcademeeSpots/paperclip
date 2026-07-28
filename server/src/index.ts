@@ -6,8 +6,8 @@ import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
 import { pathToFileURL } from "node:url";
 import type { Request as ExpressRequest, RequestHandler } from "express";
-import { createHash, randomBytes } from "node:crypto";
-import { and, eq, gt, isNull } from "drizzle-orm";
+import { createHash, createHmac } from "node:crypto";
+import { and, eq } from "drizzle-orm";
 import {
   createDb,
   invites,
@@ -38,14 +38,17 @@ import { maybePersistWorktreeRuntimePorts } from "./worktree-config.js";
 
 /**
  * When running in authenticated mode with no instance admin yet (e.g. a fresh
- * headless/Docker deploy that never ran `paperclipai onboard`), mint a
- * bootstrap CEO invite and log the URL so the first admin can be created from a
- * browser. Any prior unclaimed bootstrap invite is revoked first so the newest
- * deploy log always holds the only valid link. Skipped once an admin exists.
+ * headless/Docker deploy that never ran `paperclipai onboard`), ensure a
+ * bootstrap CEO invite exists and log its URL so the first admin can be created
+ * from a browser. The token is derived deterministically from the server secret,
+ * so the SAME invite URL is produced on every restart/redeploy (no rotation) —
+ * the user can grab it once and it keeps working until claimed. Skipped once an
+ * admin exists.
  */
 async function maybeBootstrapCeoInvite(
   db: ReturnType<typeof createDb>,
   publicBaseUrl: string | null,
+  secret: string,
 ): Promise<void> {
   try {
     const adminCount = await db
@@ -56,36 +59,33 @@ async function maybeBootstrapCeoInvite(
     if (adminCount > 0) return;
 
     const now = new Date();
-    await db
-      .update(invites)
-      .set({ revokedAt: now, updatedAt: now })
-      .where(
-        and(
-          eq(invites.inviteType, "bootstrap_ceo"),
-          isNull(invites.revokedAt),
-          isNull(invites.acceptedAt),
-          gt(invites.expiresAt, now),
-        ),
-      );
-
-    const token = `pcp_bootstrap_${randomBytes(24).toString("hex")}`;
+    // Deterministic token → stable invite URL across restarts and redeploys.
+    const token = `pcp_bootstrap_${createHmac("sha256", secret).update("bootstrap-ceo-invite-v1").digest("hex")}`;
     const tokenHash = createHash("sha256").update(token).digest("hex");
-    const expiresAt = new Date(now.getTime() + 72 * 60 * 60 * 1000);
-    await db.insert(invites).values({
-      inviteType: "bootstrap_ceo",
-      tokenHash,
-      allowedJoinTypes: "human",
-      expiresAt,
-      invitedByUserId: "system",
-    });
+    const expiresAt = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
+
+    // Upsert on the unique tokenHash: create it, or reactivate/extend if present.
+    await db
+      .insert(invites)
+      .values({
+        inviteType: "bootstrap_ceo",
+        tokenHash,
+        allowedJoinTypes: "human",
+        expiresAt,
+        invitedByUserId: "system",
+      })
+      .onConflictDoUpdate({
+        target: invites.tokenHash,
+        set: { revokedAt: null, expiresAt, updatedAt: now },
+      });
 
     const base = (publicBaseUrl ?? "").trim().replace(/\/+$/, "");
     const inviteUrl = `${base}/invite/${token}`;
     logger.info(
-      `First-admin setup: no instance admin exists yet. Open this URL to create the CEO/admin account: ${inviteUrl} (expires ${expiresAt.toISOString()})`,
+      `First-admin setup: no instance admin exists yet. Open this stable link to create the CEO/admin account (same link on every restart): ${inviteUrl}`,
     );
   } catch (err) {
-    logger.warn({ err }, "Failed to auto-generate bootstrap CEO invite");
+    logger.warn({ err }, "Failed to ensure bootstrap CEO invite");
   }
 }
 
@@ -752,9 +752,14 @@ export async function startServer(): Promise<StartedServer> {
       });
 
       if (config.deploymentMode === "authenticated") {
+        const bootstrapSecret =
+          process.env.BETTER_AUTH_SECRET?.trim() ||
+          process.env.PAPERCLIP_AGENT_JWT_SECRET?.trim() ||
+          "paperclip-bootstrap-fallback";
         void maybeBootstrapCeoInvite(
           db,
           config.authPublicBaseUrl ?? process.env.PAPERCLIP_PUBLIC_URL ?? null,
+          bootstrapSecret,
         );
       }
 
