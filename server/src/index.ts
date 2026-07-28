@@ -6,9 +6,11 @@ import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
 import { pathToFileURL } from "node:url";
 import type { Request as ExpressRequest, RequestHandler } from "express";
-import { and, eq } from "drizzle-orm";
+import { createHash, randomBytes } from "node:crypto";
+import { and, eq, gt, isNull } from "drizzle-orm";
 import {
   createDb,
+  invites,
   ensurePostgresDatabase,
   formatEmbeddedPostgresError,
   getPostgresDataDirectory,
@@ -33,6 +35,59 @@ import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
 import { getBoardClaimWarningUrl, initializeBoardClaimChallenge } from "./board-claim.js";
 import { maybePersistWorktreeRuntimePorts } from "./worktree-config.js";
+
+/**
+ * When running in authenticated mode with no instance admin yet (e.g. a fresh
+ * headless/Docker deploy that never ran `paperclipai onboard`), mint a
+ * bootstrap CEO invite and log the URL so the first admin can be created from a
+ * browser. Any prior unclaimed bootstrap invite is revoked first so the newest
+ * deploy log always holds the only valid link. Skipped once an admin exists.
+ */
+async function maybeBootstrapCeoInvite(
+  db: ReturnType<typeof createDb>,
+  publicBaseUrl: string | null,
+): Promise<void> {
+  try {
+    const adminCount = await db
+      .select()
+      .from(instanceUserRoles)
+      .where(eq(instanceUserRoles.role, "instance_admin"))
+      .then((rows) => rows.length);
+    if (adminCount > 0) return;
+
+    const now = new Date();
+    await db
+      .update(invites)
+      .set({ revokedAt: now, updatedAt: now })
+      .where(
+        and(
+          eq(invites.inviteType, "bootstrap_ceo"),
+          isNull(invites.revokedAt),
+          isNull(invites.acceptedAt),
+          gt(invites.expiresAt, now),
+        ),
+      );
+
+    const token = `pcp_bootstrap_${randomBytes(24).toString("hex")}`;
+    const tokenHash = createHash("sha256").update(token).digest("hex");
+    const expiresAt = new Date(now.getTime() + 72 * 60 * 60 * 1000);
+    await db.insert(invites).values({
+      inviteType: "bootstrap_ceo",
+      tokenHash,
+      allowedJoinTypes: "human",
+      expiresAt,
+      invitedByUserId: "system",
+    });
+
+    const base = (publicBaseUrl ?? "").trim().replace(/\/+$/, "");
+    const inviteUrl = `${base}/invite/${token}`;
+    logger.info(
+      `First-admin setup: no instance admin exists yet. Open this URL to create the CEO/admin account: ${inviteUrl} (expires ${expiresAt.toISOString()})`,
+    );
+  } catch (err) {
+    logger.warn({ err }, "Failed to auto-generate bootstrap CEO invite");
+  }
+}
 
 type BetterAuthSessionUser = {
   id: string;
@@ -695,6 +750,13 @@ export async function startServer(): Promise<StartedServer> {
         databaseBackupRetentionDays: config.databaseBackupRetentionDays,
         databaseBackupDir: config.databaseBackupDir,
       });
+
+      if (config.deploymentMode === "authenticated") {
+        void maybeBootstrapCeoInvite(
+          db,
+          config.authPublicBaseUrl ?? process.env.PAPERCLIP_PUBLIC_URL ?? null,
+        );
+      }
 
       const boardClaimUrl = getBoardClaimWarningUrl(config.host, listenPort);
       if (boardClaimUrl) {
