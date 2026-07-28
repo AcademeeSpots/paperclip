@@ -90,6 +90,33 @@ async function maybeBootstrapCeoInvite(
 }
 
 /**
+ * Instance reset (opt-in, destructive): if PAPERCLIP_RESET_INSTANCE is set to
+ * the exact confirmation value "yes-wipe-everything", truncate all users,
+ * companies, roles, and invites on startup for a clean slate. Runs before the
+ * bootstrap-invite step so a fresh first-admin invite is minted afterwards.
+ * The operator MUST remove the env var after the reset deploy, before signing
+ * up, or the next redeploy wipes again.
+ */
+async function maybeResetInstance(
+  db: ReturnType<typeof createDb>,
+): Promise<void> {
+  if (process.env.PAPERCLIP_RESET_INSTANCE?.trim() !== "yes-wipe-everything") return;
+  try {
+    logger.warn(
+      "PAPERCLIP_RESET_INSTANCE=yes-wipe-everything — WIPING all users, companies, roles, and invites for a fresh start",
+    );
+    await db.execute(
+      sql`TRUNCATE TABLE companies, "user", instance_user_roles, invites RESTART IDENTITY CASCADE`,
+    );
+    logger.warn(
+      "Instance reset complete. IMPORTANT: remove the PAPERCLIP_RESET_INSTANCE variable NOW (before signing up), or the next redeploy will wipe everything again.",
+    );
+  } catch (err) {
+    logger.error({ err }, "Failed to reset instance");
+  }
+}
+
+/**
  * Admin recovery: if PAPERCLIP_PROMOTE_ADMIN_EMAIL is set, grant the
  * instance_admin role to the account with that email on startup. Lets an
  * operator who is locked out of the original admin (forgotten password, wrong
@@ -798,12 +825,13 @@ export async function startServer(): Promise<StartedServer> {
           process.env.BETTER_AUTH_SECRET?.trim() ||
           process.env.PAPERCLIP_AGENT_JWT_SECRET?.trim() ||
           "paperclip-bootstrap-fallback";
-        void maybeBootstrapCeoInvite(
-          db,
-          config.authPublicBaseUrl ?? process.env.PAPERCLIP_PUBLIC_URL ?? null,
-          bootstrapSecret,
-        );
-        void maybePromoteAdminByEmail(db);
+        const publicBaseUrl =
+          config.authPublicBaseUrl ?? process.env.PAPERCLIP_PUBLIC_URL ?? null;
+        void (async () => {
+          await maybeResetInstance(db);
+          await maybeBootstrapCeoInvite(db, publicBaseUrl, bootstrapSecret);
+          await maybePromoteAdminByEmail(db);
+        })();
       }
 
       const boardClaimUrl = getBoardClaimWarningUrl(config.host, listenPort);
