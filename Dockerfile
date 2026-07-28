@@ -52,7 +52,8 @@ ENV NODE_ENV=production \
   PAPERCLIP_DEPLOYMENT_MODE=authenticated \
   PAPERCLIP_DEPLOYMENT_EXPOSURE=private
 
-VOLUME ["/paperclip"]
+# NOTE: no VOLUME instruction — some hosts (e.g. Railway) reject it at build
+# time. Persist /paperclip via the host's own volume mechanism when needed.
 EXPOSE 3100
 
 USER node
