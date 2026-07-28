@@ -7,7 +7,7 @@ import { stdin, stdout } from "node:process";
 import { pathToFileURL } from "node:url";
 import type { Request as ExpressRequest, RequestHandler } from "express";
 import { createHash, createHmac } from "node:crypto";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import {
   createDb,
   invites,
@@ -86,6 +86,48 @@ async function maybeBootstrapCeoInvite(
     );
   } catch (err) {
     logger.warn({ err }, "Failed to ensure bootstrap CEO invite");
+  }
+}
+
+/**
+ * Admin recovery: if PAPERCLIP_PROMOTE_ADMIN_EMAIL is set, grant the
+ * instance_admin role to the account with that email on startup. Lets an
+ * operator who is locked out of the original admin (forgotten password, wrong
+ * account) sign up/sign in with any account, set this env var, redeploy, and
+ * regain admin access. No-op if the email is unset or the account doesn't
+ * exist yet (sign up first, then redeploy). Idempotent.
+ */
+async function maybePromoteAdminByEmail(
+  db: ReturnType<typeof createDb>,
+): Promise<void> {
+  const email = process.env.PAPERCLIP_PROMOTE_ADMIN_EMAIL?.trim();
+  if (!email) return;
+  try {
+    const user = await db
+      .select({ id: authUsers.id, email: authUsers.email })
+      .from(authUsers)
+      .where(sql`lower(${authUsers.email}) = lower(${email})`)
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (!user) {
+      logger.warn(
+        { email },
+        "PAPERCLIP_PROMOTE_ADMIN_EMAIL is set but no account with that email exists yet — sign up at /auth first, then redeploy",
+      );
+      return;
+    }
+    await db
+      .insert(instanceUserRoles)
+      .values({ userId: user.id, role: "instance_admin" })
+      .onConflictDoNothing({
+        target: [instanceUserRoles.userId, instanceUserRoles.role],
+      });
+    logger.info(
+      { email: user.email },
+      "PAPERCLIP_PROMOTE_ADMIN_EMAIL: this account now has the instance_admin role",
+    );
+  } catch (err) {
+    logger.warn({ err }, "Failed to promote admin by email");
   }
 }
 
@@ -761,6 +803,7 @@ export async function startServer(): Promise<StartedServer> {
           config.authPublicBaseUrl ?? process.env.PAPERCLIP_PUBLIC_URL ?? null,
           bootstrapSecret,
         );
+        void maybePromoteAdminByEmail(db);
       }
 
       const boardClaimUrl = getBoardClaimWarningUrl(config.host, listenPort);
